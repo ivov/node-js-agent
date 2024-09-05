@@ -3,24 +3,24 @@ import { runInNewContext, type Context } from 'node:vm';
 import { type MessageEvent, WebSocket } from 'ws';
 import { nanoid } from 'nanoid';
 import {
-	INode,
-	INodeType,
-	ITaskDataConnections,
+	type INode,
+	type INodeType,
+	type ITaskDataConnections,
 	WorkflowDataProxy,
-	WorkflowParameters,
+	type WorkflowParameters,
 } from 'n8n-workflow';
 import {
-	IDataObject,
-	IExecuteData,
-	INodeExecutionData,
-	INodeParameters,
-	IRunExecutionData,
-	IWorkflowDataProxyAdditionalKeys,
+	type IDataObject,
+	type IExecuteData,
+	type INodeExecutionData,
+	type INodeParameters,
+	type IRunExecutionData,
+	type IWorkflowDataProxyAdditionalKeys,
 	Workflow,
-	WorkflowExecuteMode,
+	type WorkflowExecuteMode,
 } from 'n8n-workflow';
 
-import type { AgentMessage, N8nMessage } from './agent-types';
+import { RPC_ALLOW_LIST, type AgentMessage, type N8nMessage } from './agent-types';
 
 interface AgentJob<T = unknown> {
 	jobId: string;
@@ -36,6 +36,12 @@ interface JobOffer {
 
 interface DataRequest {
 	requestId: string;
+	resolve: (data: unknown) => void;
+	reject: (error: unknown) => void;
+}
+
+interface RPCCall {
+	callId: string;
 	resolve: (data: unknown) => void;
 	reject: (error: unknown) => void;
 }
@@ -57,6 +63,8 @@ class Agent {
 	openOffers: Record<JobOffer['offerId'], JobOffer> = {};
 
 	dataRequests: Record<DataRequest['requestId'], DataRequest> = {};
+
+	rpcCalls: Record<RPCCall['callId'], RPCCall> = {};
 
 	constructor(
 		public jobType: string,
@@ -114,7 +122,6 @@ class Agent {
 						process.hrtime.bigint() + BigInt((VALID_TIME_MS + VALID_EXTRA_MS) * 1_000_000), // Adding a little extra time to account for latency
 				};
 				this.openOffers[offer.offerId] = offer;
-				// console.log('Offering job:', offer.offerId);
 				this.send({
 					type: 'agent:joboffer',
 					jobType: this.jobType,
@@ -154,6 +161,8 @@ class Agent {
 			case 'n8n:jobdataresponse':
 				this.processDataResponse(message.requestId, message.data);
 				break;
+			case 'n8n:rpcresponse':
+				this.handleRpcResponse(message.callId, message.status, message.data);
 		}
 	}
 
@@ -290,6 +299,67 @@ class Agent {
 
 		return p as T;
 	}
+
+	async makeRpcCall(jobId: string, name: AgentMessage.ToN8n.RPC['name'], params: unknown[]) {
+		const callId = nanoid();
+
+		const dataPromise = new Promise((resolve, reject) => {
+			this.rpcCalls[callId] = {
+				callId,
+				resolve,
+				reject,
+			};
+		});
+
+		this.send({
+			type: 'agent:rpc',
+			callId,
+			jobId,
+			name,
+			params,
+		});
+
+		try {
+			return await dataPromise;
+		} finally {
+			delete this.rpcCalls[callId];
+		}
+	}
+
+	handleRpcResponse(
+		callId: string,
+		status: N8nMessage.ToAgent.RPCResponse['status'],
+		data: unknown,
+	) {
+		const call = this.rpcCalls[callId];
+		if (!call) {
+			return;
+		}
+		if (status === 'success') {
+			call.resolve(data);
+		} else {
+			call.reject(typeof data === 'string' ? new Error(data) : data);
+		}
+	}
+
+	buildRpcCallObject(jobId: string) {
+		const rpcObject: any = {};
+		for (const r of RPC_ALLOW_LIST) {
+			const splitPath = r.split('.');
+			let obj = rpcObject;
+
+			splitPath.forEach((s, index) => {
+				if (index !== splitPath.length - 1) {
+					obj[s] = {};
+					obj = obj[s];
+					return;
+				}
+				// eslint-disable-next-line
+				obj[s] = (...args: unknown[]) => this.makeRpcCall(jobId, r, args);
+			});
+		}
+		return rpcObject;
+	}
 }
 
 interface JSExecSettings {
@@ -321,18 +391,15 @@ const getAdditionalKeys = (): IWorkflowDataProxyAdditionalKeys => {
 	return {};
 };
 
-class TestAgent extends Agent {
+class JsAgent extends Agent {
 	constructor(jobType: string, wsUrl: string, maxConcurrency: number, name?: string) {
 		super(jobType, wsUrl, maxConcurrency, name ?? 'Test Agent');
 	}
 
 	async executeJob(job: AgentJob<JSExecSettings>): Promise<AgentMessage.ToN8n.JobDone['data']> {
-		console.log('Executing: ', job);
-
 		const allData = await this.requestData<AllData>(job.jobId, 'all');
 
 		const settings = job.settings!;
-		console.log(allData, settings);
 
 		const workflowParams = allData.workflow;
 		const workflow = new Workflow({
@@ -371,6 +438,7 @@ class TestAgent extends Agent {
 			module: {},
 
 			...dataProxy.getDataProxy(),
+			...this.buildRpcCallObject(job.jobId),
 		};
 
 		const result = (await runInNewContext(
@@ -382,4 +450,4 @@ class TestAgent extends Agent {
 	}
 }
 
-new TestAgent('javascript', 'ws://localhost:5678/rest/agents/_ws', 5);
+new JsAgent('javascript', 'ws://localhost:5678/rest/agents/_ws', 5);
